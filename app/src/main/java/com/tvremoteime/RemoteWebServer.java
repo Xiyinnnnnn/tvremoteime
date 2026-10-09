@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Executors;
 
 /**
@@ -29,6 +30,8 @@ final class RemoteWebServer {
 
     private final Context context;
     private final ExecutorService clients = Executors.newCachedThreadPool();
+    // 发送必须离开 IME 主线程：主线程写 socket 会抛 NetworkOnMainThreadException
+    private final ExecutorService sender = Executors.newSingleThreadExecutor();
     private final CopyOnWriteArrayList<Socket> webSockets = new CopyOnWriteArrayList<>();
     private volatile Listener listener;
     private volatile ServerSocket server;
@@ -220,20 +223,27 @@ final class RemoteWebServer {
         }
     }
 
+    /** IME 主线程安全入口：真正写 socket 交给单线程 sender，避免 NetworkOnMainThreadException。 */
     static void sendTextState(String text) {
-        if (instance == null) return;
+        final RemoteWebServer inst = instance;
+        if (inst == null) return;
         String safe = jsonEscape(text == null ? "" : text);
-        instance.sendToAll("{\"type\":\"text\",\"text\":\"" + safe + "\"}");
+        final String json = "{\"type\":\"text\",\"text\":\"" + safe + "\"}";
+        try {
+            inst.sender.execute(new Runnable() {
+                @Override public void run() { inst.sendToAll(json); }
+            });
+        } catch (RejectedExecutionException ignored) {
+        }
     }
 
-    static void sendToAll(String json) {
-        if (instance == null) return;
+    private void sendToAll(String json) {
         byte[] data = json.getBytes(StandardCharsets.UTF_8);
-        for (Socket socket : instance.webSockets) {
+        for (Socket socket : webSockets) {
             try {
                 sendFrame(socket, 1, data);
             } catch (IOException e) {
-                instance.webSockets.remove(socket);
+                webSockets.remove(socket);
                 closeQuietly(socket);
             }
         }
@@ -245,22 +255,24 @@ final class RemoteWebServer {
     }
 
     private static void sendFrame(Socket socket, int opcode, byte[] data) throws IOException {
-        OutputStream out = socket.getOutputStream();
-        int n = data.length;
-        out.write(0x80 | (opcode & 0x0F));
-        if (n < 126) {
-            out.write(n);
-        } else if (n <= 0xFFFF) {
-            out.write(126);
-            out.write((n >> 8) & 0xFF);
-            out.write(n & 0xFF);
-        } else {
-            out.write(127);
-            long len = n;
-            for (int i = 7; i >= 0; i--) out.write((int) (len >>> (8 * i)) & 0xFF);
+        synchronized (socket) {   // pong / 广播 / 断连帧共用同一 socket，需串行写
+            OutputStream out = socket.getOutputStream();
+            int n = data.length;
+            out.write(0x80 | (opcode & 0x0F));
+            if (n < 126) {
+                out.write(n);
+            } else if (n <= 0xFFFF) {
+                out.write(126);
+                out.write((n >> 8) & 0xFF);
+                out.write(n & 0xFF);
+            } else {
+                out.write(127);
+                long len = n;
+                for (int i = 7; i >= 0; i--) out.write((int) (len >>> (8 * i)) & 0xFF);
+            }
+            out.write(data);
+            out.flush();
         }
-        out.write(data);
-        out.flush();
     }
 
     private static void writeHttp(Socket socket, int code, String type, byte[] body) throws IOException {
